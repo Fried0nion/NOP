@@ -6,8 +6,15 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import warnings
 from supabase import create_client, Client
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import logging
 
 warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Set page config
 st.set_page_config(
@@ -16,6 +23,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Task 1: Define Column Schemas for Selective Data Fetching
+COLUMN_SCHEMAS = {
+    'sitelist': [
+        'Site ID', 'Site_Name', 'VENDOR', 'Class INAP W31', 
+        'KABUPATEN', 'Zone', 'PIC'
+    ],
+    'availability': [
+        'availability', 'vendor', 'site_class', 'Meet/notmeet', 
+        'outage', 'duration_power', 'duration_ran', 'duration_transport', 'duration_other'
+    ],
+    'packet_loss': [
+        'SITE ID', 'SITE NAME', 'AVG PACKET LOSS', 'PL STATUS - 0.1%'
+    ],
+    'prb_util': [
+        'prb_util', 'dl_thp', 'cqi', 'rrc_user_max', 'kabupaten'
+    ],
+    'rci': [
+        'kabupaten', 'prb_util_sector', 'site_id', 
+        'remark_redsector_final', 'unbalanced_prb'
+    ],
+    'payload': [
+        'tgl', 'payl (GB)', 'kabupaten', 'site_id'
+    ],
+    'ccm': [
+        'CreateTime', 'BusinessStatus', 'SLA Category', 
+        'Priority', 'RootCauseRO'
+    ],
+    'data_incident': [
+        'Business Status', 'IN SLA / Ou SLA', 
+        'Site ID (e.g. ABC123)(Create TT_siteid)', 
+        'Severity(Create TT_severity)', 'Root cause category tier 1'
+    ]
+}
 
 # Custom CSS
 st.markdown("""
@@ -48,9 +89,15 @@ def init_supabase() -> Client:
         st.error(f"Error initializing Supabase: {e}")
         st.stop()
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def load_data():
-    """Load data from Supabase tables with pagination for large datasets"""
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def load_data_with_timing():
+    """
+    Load data from Supabase tables with:
+    - Task 1: Selective column fetching
+    - Task 2: Parallel table loading
+    - Task 4: RCI pagination optimization
+    - Task 5: Timing telemetry
+    """
     
     supabase = init_supabase()
     
@@ -69,19 +116,35 @@ def load_data():
     data = {}
     progress_bar = st.progress(0)
     status_text = st.empty()
+    timing_data = {}
     
-    def fetch_all_rows(table_name, page_size=1000):
-        """Fetch all rows from a table using pagination"""
+    # Track overall timing
+    overall_start = time.time()
+    
+    def fetch_all_rows(table_name, columns=None, page_size=1000):
+        """
+        Fetch all rows from a table using pagination with selective columns.
+        Task 1 & 4: Uses column schema and adaptive page sizing for RCI
+        """
         all_rows = []
         offset = 0
         
+        # Task 4: Adaptive page size - RCI is large, use smaller batches
+        if table_name == 'RCI':
+            page_size = 500
+        
+        # Build column selection string (Task 1)
+        if columns:
+            column_str = ", ".join([f'"{col}"' for col in columns])
+        else:
+            column_str = "*"
+        
         while True:
             try:
-                response = supabase.table(table_name).select("*").range(offset, offset + page_size - 1).execute()
+                response = supabase.table(table_name).select(column_str).range(offset, offset + page_size - 1).execute()
                 
                 if response.data:
                     all_rows.extend(response.data)
-                    # If we got fewer rows than page_size, we've reached the end
                     if len(response.data) < page_size:
                         break
                     offset += page_size
@@ -94,43 +157,151 @@ def load_data():
         
         return all_rows
     
+    def fetch_table_task(key, table_name):
+        """
+        Wrapper for parallel execution with timing (Task 2 & 5)
+        """
+        start_time = time.time()
+        try:
+            columns = COLUMN_SCHEMAS.get(key)
+            all_rows = fetch_all_rows(table_name, columns=columns)
+            
+            elapsed = time.time() - start_time
+            row_count = len(all_rows) if all_rows else 0
+            
+            # Calculate data size estimate (roughly 1KB per row with selective columns)
+            data_size_mb = (row_count * 1.0) / 1024
+            
+            timing_data[table_name] = {
+                'elapsed_seconds': round(elapsed, 2),
+                'row_count': row_count,
+                'data_size_mb': round(data_size_mb, 2),
+                'rows_per_second': round(row_count / elapsed, 0) if elapsed > 0 else 0
+            }
+            
+            logger.info(f"✓ {table_name}: {row_count} rows in {elapsed:.2f}s ({timing_data[table_name]['rows_per_second']:.0f} rows/sec)")
+            
+            return key, table_name, all_rows, None
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"✗ {table_name} failed after {elapsed:.2f}s: {str(e)}")
+            return key, table_name, None, str(e)
+    
     try:
-        # Load each table from Supabase
-        for idx, (key, table_name) in enumerate(table_names.items()):
-            try:
-                status_text.text(f"Loading {table_name}...")
+        # Task 2: Load tables in parallel using ThreadPoolExecutor (max 4 concurrent)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Submit all fetch tasks at once
+            futures = {
+                executor.submit(fetch_table_task, key, table_name): (key, table_name)
+                for key, table_name in table_names.items()
+            }
+            
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(futures):
+                key, table_name, all_rows, error = future.result()
                 
-                # Fetch all rows with pagination
-                all_rows = fetch_all_rows(table_name)
+                if error:
+                    st.error(f"Error loading {table_name}: {error}")
+                    return None, None
                 
-                # Convert response to DataFrame
+                # Convert to DataFrame
                 if all_rows:
                     data[key] = pd.DataFrame(all_rows)
                 else:
                     st.warning(f"⚠️ Table {table_name} is empty")
                     data[key] = pd.DataFrame()
-                    
-            except Exception as e:
-                st.error(f"Error loading {table_name}: {str(e)}")
-                return None
-            
-            # Update progress
-            progress_bar.progress((idx + 1) / len(table_names))
+                
+                # Update status
+                if table_name in timing_data:
+                    status_text.text(f"✓ {table_name} ({timing_data[table_name]['row_count']} rows)")
+                
+                completed += 1
+                progress_bar.progress(completed / len(table_names))
         
-        status_text.success("✓ All data loaded from Supabase!")
+        overall_elapsed = time.time() - overall_start
+        
+        # Task 5: Log timing summary
+        logger.info("=" * 70)
+        logger.info("LOAD TIMING SUMMARY (24-hour cache)")
+        logger.info("=" * 70)
+        
+        total_rows = 0
+        total_mb = 0
+        
+        for table_name in sorted(table_names.values()):
+            if table_name in timing_data:
+                t = timing_data[table_name]
+                logger.info(f"{table_name:20s} | {t['row_count']:>8d} rows | {t['elapsed_seconds']:>6.2f}s | {t['rows_per_second']:>7.0f} rows/s")
+                total_rows += t['row_count']
+                total_mb += t['data_size_mb']
+        
+        logger.info("=" * 70)
+        logger.info(f"TOTAL: {total_rows} rows | {overall_elapsed:.2f}s | {total_mb:.1f}MB (est)")
+        logger.info("=" * 70)
+        
+        status_text.success(f"✓ All data loaded in {overall_elapsed:.1f}s! (24-hour cache active)")
         progress_bar.empty()
-        return data
+        
+        return data, timing_data
         
     except Exception as e:
         st.error(f"Error loading data from Supabase: {str(e)}")
-        return None
+        return None, None
 
 # Load data
-data = load_data()
+result = load_data_with_timing()
 
-if data is None:
+if result[0] is None:
     st.error("Failed to load data from Supabase.")
     st.stop()
+
+data, timing_data = result
+
+# Task 3: Pre-compute Key Metrics at Data Load Time
+@st.cache_data(ttl=86400)
+def compute_metrics(data):
+    """Pre-compute frequently used metrics to avoid recalculation on every page render"""
+    metrics = {
+        'availability': {
+            'avg': data['availability']['availability'].mean(),
+            'min': data['availability']['availability'].min(),
+            'max': data['availability']['availability'].max(),
+            'total_records': len(data['availability']),
+            'unique_vendors': data['availability']['vendor'].nunique(),
+            'unique_classes': data['availability']['site_class'].nunique(),
+        },
+        'packet_loss': {
+            'avg': data['packet_loss']['AVG PACKET LOSS'].mean(),
+            'max': data['packet_loss']['AVG PACKET LOSS'].max(),
+            'total_records': len(data['packet_loss']),
+        },
+        'prb_util': {
+            'avg': data['prb_util']['prb_util'].mean(),
+            'max': data['prb_util']['prb_util'].max(),
+            'min': data['prb_util']['prb_util'].min(),
+            'total_records': len(data['prb_util']),
+        },
+        'rci': {
+            'total_records': len(data['rci']),
+            'unique_sites': data['rci']['site_id'].nunique(),
+        },
+        'sitelist': {
+            'total_sites': len(data['sitelist']),
+        },
+        'ccm': {
+            'total_complaints': len(data['ccm']),
+            'closed_count': (data['ccm']['BusinessStatus'] == 'Closed').sum(),
+        },
+        'data_incident': {
+            'total_incidents': len(data['data_incident']),
+        }
+    }
+    
+    logger.info("Pre-computed metrics cached successfully")
+    return metrics
+
+metrics = compute_metrics(data)
 
 # Dashboard Title
 st.title("📊 NOP Data Analysis Dashboard")
@@ -141,8 +312,9 @@ with st.sidebar:
     st.header("Navigation")
     page = st.radio(
         "Select Dashboard:",
-        ["Overview", "Availability Analysis", "Packet Loss Analysis", "PRB Utilization", 
-         "RCI Analysis", "Payload Analysis", "Complaints (CCM)", "Incidents", "Site Information"]
+        ["Overview", "Availability Analysis", "Packet Loss Analysis", "PRB Utilization",
+         "RCI Analysis", "Payload Analysis", "Complaints (CCM)", "Incidents", "Site Information",
+         "Load Timing Stats"]
     )
 
 # Helper function to convert week format
@@ -162,40 +334,37 @@ if page == "Overview":
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Sites", len(data['sitelist']))
+        st.metric("Total Sites", metrics['sitelist']['total_sites'])
     
     with col2:
-        st.metric("Total Availability Records", len(data['availability']))
+        st.metric("Total Availability Records", metrics['availability']['total_records'])
     
     with col3:
-        st.metric("Total CCM Complaints", len(data['ccm']))
+        st.metric("Total CCM Complaints", metrics['ccm']['total_complaints'])
     
     with col4:
-        st.metric("Total Incidents", len(data['data_incident']))
+        st.metric("Total Incidents", metrics['data_incident']['total_incidents'])
     
-    st.subheader("Key Statistics")
+    st.subheader("Key Statistics (Pre-computed)")
     
     tab1, tab2, tab3 = st.tabs(["Availability", "Packet Loss", "PRB Utilization"])
     
     with tab1:
-        avg_availability = data['availability']['availability'].mean()
-        st.metric("Average Availability", f"{avg_availability:.2f}%")
+        st.metric("Average Availability", f"{metrics['availability']['avg']:.2f}%")
         
         fig = px.histogram(data['availability'], x='availability', nbins=50, 
                           title='Availability Distribution')
         st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
-        avg_pl = data['packet_loss']['AVG PACKET LOSS'].mean()
-        st.metric("Average Packet Loss", f"{avg_pl:.4f}%")
+        st.metric("Average Packet Loss", f"{metrics['packet_loss']['avg']:.4f}%")
         
         fig = px.box(data['packet_loss'], y='AVG PACKET LOSS', 
                     title='Packet Loss Distribution')
         st.plotly_chart(fig, use_container_width=True)
     
     with tab3:
-        avg_prb = data['prb_util']['prb_util'].mean()
-        st.metric("Average PRB Utilization", f"{avg_prb:.2f}%")
+        st.metric("Average PRB Utilization", f"{metrics['prb_util']['avg']:.2f}%")
         
         fig = px.histogram(data['prb_util'], x='prb_util', nbins=50,
                           title='PRB Utilization Distribution')
@@ -280,10 +449,10 @@ elif page == "Packet Loss Analysis":
     col1, col2 = st.columns(2)
     
     with col1:
-        st.metric("Average Packet Loss", f"{data['packet_loss']['AVG PACKET LOSS'].mean():.4f}%")
+        st.metric("Average Packet Loss", f"{metrics['packet_loss']['avg']:.4f}%")
     
     with col2:
-        st.metric("Max Packet Loss", f"{data['packet_loss']['AVG PACKET LOSS'].max():.4f}%")
+        st.metric("Max Packet Loss", f"{metrics['packet_loss']['max']:.4f}%")
     
     tab1, tab2, tab3 = st.tabs(["Distribution", "Status Analysis", "Top Sites"])
     
@@ -311,13 +480,13 @@ elif page == "PRB Utilization":
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Average PRB Util", f"{data['prb_util']['prb_util'].mean():.2f}%")
+        st.metric("Average PRB Util", f"{metrics['prb_util']['avg']:.2f}%")
     
     with col2:
-        st.metric("Max PRB Util", f"{data['prb_util']['prb_util'].max():.2f}%")
+        st.metric("Max PRB Util", f"{metrics['prb_util']['max']:.2f}%")
     
     with col3:
-        st.metric("Min PRB Util", f"{data['prb_util']['prb_util'].min():.2f}%")
+        st.metric("Min PRB Util", f"{metrics['prb_util']['min']:.2f}%")
     
     col1, col2 = st.columns(2)
     
@@ -578,3 +747,89 @@ elif page == "Site Information":
     display_cols = ['Site ID', 'Site_Name', 'VENDOR', 'Class INAP W31', 'KABUPATEN', 'Zone', 'PIC']
     available_cols = [col for col in display_cols if col in filtered_sites.columns]
     st.dataframe(filtered_sites[available_cols], use_container_width=True)
+
+# ============== LOAD TIMING STATS ==============
+elif page == "Load Timing Stats":
+    st.header("⏱️ Load Timing Stats")
+    st.markdown("Performance telemetry from the most recent data load (cached for 24 hours).")
+
+    if not timing_data:
+        st.warning("No timing data available. Reload the page to trigger a fresh data load.")
+    else:
+        total_elapsed = sum(t['elapsed_seconds'] for t in timing_data.values())
+        total_rows = sum(t['row_count'] for t in timing_data.values())
+        total_mb = sum(t['data_size_mb'] for t in timing_data.values())
+
+        # Summary metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Load Time", f"{total_elapsed:.2f}s")
+        with col2:
+            st.metric("Total Rows Loaded", f"{total_rows:,}")
+        with col3:
+            st.metric("Est. Data Size", f"{total_mb:.1f} MB")
+
+        st.markdown("---")
+        st.subheader("Per-Table Breakdown")
+
+        # Build a summary DataFrame for display
+        timing_rows = []
+        for table_name in sorted(timing_data.keys()):
+            t = timing_data[table_name]
+            timing_rows.append({
+                "Table": table_name,
+                "Load Time (s)": t['elapsed_seconds'],
+                "Rows": t['row_count'],
+                "Est. Size (MB)": t['data_size_mb'],
+                "Rows / sec": int(t['rows_per_second'])
+            })
+        timing_df = pd.DataFrame(timing_rows)
+        st.dataframe(timing_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("Visualizations")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            fig_time = px.bar(
+                timing_df, x="Table", y="Load Time (s)",
+                title="Load Time per Table (seconds)",
+                labels={"Load Time (s)": "Seconds"},
+                color="Load Time (s)",
+                color_continuous_scale="Blues"
+            )
+            fig_time.update_layout(showlegend=False)
+            st.plotly_chart(fig_time, use_container_width=True)
+
+        with col2:
+            fig_rows = px.bar(
+                timing_df, x="Table", y="Rows",
+                title="Rows Loaded per Table",
+                color="Rows",
+                color_continuous_scale="Greens"
+            )
+            fig_rows.update_layout(showlegend=False)
+            st.plotly_chart(fig_rows, use_container_width=True)
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            fig_rate = px.bar(
+                timing_df, x="Table", y="Rows / sec",
+                title="Fetch Rate per Table (rows/sec)",
+                color="Rows / sec",
+                color_continuous_scale="Oranges"
+            )
+            fig_rate.update_layout(showlegend=False)
+            st.plotly_chart(fig_rate, use_container_width=True)
+
+        with col4:
+            fig_size = px.bar(
+                timing_df, x="Table", y="Est. Size (MB)",
+                title="Estimated Data Size per Table (MB)",
+                color="Est. Size (MB)",
+                color_continuous_scale="Purples"
+            )
+            fig_size.update_layout(showlegend=False)
+            st.plotly_chart(fig_size, use_container_width=True)
